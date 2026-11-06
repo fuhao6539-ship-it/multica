@@ -33,6 +33,7 @@ func (s *IssueWakeupService) RecoverOrphanedNativeEventTasks(ctx context.Context
        LEFT JOIN issue i ON i.id=t.issue_id
        LEFT JOIN workspace w ON w.id=i.workspace_id
        LEFT JOIN agent a ON a.id=t.agent_id
+       LEFT JOIN agent_runtime er ON er.id=t.runtime_id
        WHERE t.context->>'oracle_issue_event'='true'
          AND t.status IN ('queued','deferred','dispatched','waiting_local_directory')
          AND t.started_at IS NULL
@@ -44,6 +45,24 @@ func (s *IssueWakeupService) RecoverOrphanedNativeEventTasks(ctx context.Context
            OR i.assignee_id IS DISTINCT FROM t.agent_id
            OR a.workspace_id IS DISTINCT FROM i.workspace_id
            OR a.runtime_id IS DISTINCT FROM t.runtime_id
+           OR a.kind IS DISTINCT FROM 'user'
+           OR a.archived_at IS NOT NULL
+           OR er.workspace_id IS DISTINCT FROM i.workspace_id
+           OR er.provider IS DISTINCT FROM 'hermes'
+           -- The configured original invoker must still be a member
+           -- permitted by the original agent invocation policy.
+           OR NOT EXISTS (
+             SELECT 1 FROM member em
+             WHERE em.workspace_id=i.workspace_id
+               AND em.user_id::text=w.settings#>>'{oracle_issue_events,actor_user_id}'
+               AND (a.owner_id=em.user_id
+                 OR (a.permission_mode='public_to' AND EXISTS (
+                   SELECT 1 FROM agent_invocation_target ait
+                   WHERE ait.agent_id=a.id
+                     AND ((ait.target_type='workspace' AND ait.target_id=i.workspace_id)
+                       OR (ait.target_type='member' AND ait.target_id=em.user_id))
+                 )))
+           )
            OR COALESCE(w.settings->'oracle_issue_events'->>'enabled','false') <> 'true'
            OR NOT EXISTS (
              SELECT 1 FROM jsonb_array_elements_text(
