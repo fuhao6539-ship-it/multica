@@ -133,7 +133,7 @@ func TestNativeOracleIssueEventStartVsWorkspaceRevoke(t *testing.T) {
 }
 
 
- // TestNativeOracleClaimStartVsIssueClose exercises the real claim-token
+// TestNativeOracleClaimStartVsIssueClose exercises the real claim-token
  // service entrypoint, not only the generated Start SQL. A concurrent Issue
  // close holds its Issue row before it cancels the native queued Task.
 func TestNativeOracleClaimStartVsIssueClose(t *testing.T) {
@@ -198,5 +198,70 @@ func TestNativeOracleClaimStartVsIssueClose(t *testing.T) {
 		"SELECT count(*) FROM agent_task_queue WHERE id=$1 AND status='cancelled' AND started_at IS NULL",
 		taskID); got != 1 {
 		t.Fatalf("closed Issue left %d safely cancelled Tasks; want one", got)
+	}
+}
+
+
+// TestNativeOracleClaimReclaimRevokedActor executes the native queue SQL
+ // on a real PostgreSQL test database, never a copied authorization predicate.
+func TestNativeOracleClaimReclaimRevokedActor(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		recover bool
+		batch bool
+	}{
+		{"claim", false, false},
+		{"reclaim_one", true, false},
+		{"reclaim_batch", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, taskID, agentID, runtimeID := nativeEventStartFixture(t)
+			ctx := context.Background()
+			rt := util.MustParseUUID(runtimeID)
+			// A removed invoker must not regain authority merely because
+			// their Task was already queued or dispatched.
+			f.Exec(t, "DELETE FROM member WHERE workspace_id=$1 AND user_id=$2",
+				f.WorkspaceID, f.UserID)
+			if !tc.recover {
+				f.Exec(t, "UPDATE agent_task_queue SET status='queued',dispatched_at=NULL WHERE id=$1", taskID)
+				_, err := f.q.ClaimAgentTask(ctx, db.ClaimAgentTaskParams{
+					AgentID: util.MustParseUUID(agentID), RuntimeID: rt,
+					PrepareLeaseSecs: 60, RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+				})
+				if !errors.Is(err, pgx.ErrNoRows) {
+					t.Fatalf("revoked actor was claimable: %v", err)
+				}
+			} else {
+				f.Exec(t, `UPDATE agent_task_queue SET
+					dispatched_at=now()-interval '8 minutes',
+					prepare_lease_expires_at=now()-interval '2 minutes'
+					WHERE id=$1`, taskID)
+				if tc.batch {
+					tasks, err := f.q.ReclaimStaleDispatchedTasksForRuntimes(ctx,
+						db.ReclaimStaleDispatchedTasksForRuntimesParams{
+							RuntimeIds: []pgtype.UUID{rt}, PrepareLeaseSecs: 60,
+							ClaimRecoverySecs: 30, RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+							MaxTasks: 3,
+						})
+					if err != nil || len(tasks) != 0 {
+						t.Fatalf("batch reclaimed revoked actor: %d tasks, error %v", len(tasks), err)
+					}
+				} else {
+					_, err := f.q.ReclaimStaleDispatchedTaskForRuntime(ctx,
+						db.ReclaimStaleDispatchedTaskForRuntimeParams{
+							RuntimeID: rt, PrepareLeaseSecs: 60,
+							ClaimRecoverySecs: 30, RuntimeStaleSecs: RuntimeClaimFreshnessSeconds,
+						})
+					if !errors.Is(err, pgx.ErrNoRows) {
+						t.Fatalf("reclaimed revoked actor: %v", err)
+					}
+				}
+			}
+			if count := f.Count(t,
+				"SELECT count(*) FROM agent_task_queue WHERE id=$1 AND status='running'",
+				taskID); count != 0 {
+				t.Fatalf("revoked actor started %d Tasks", count)
+			}
+		})
 	}
 }
