@@ -8,6 +8,31 @@ WITH candidate AS MATERIALIZED (
     JOIN agent_runtime r ON r.id = t.runtime_id
     WHERE t.id = @task_id
       AND t.status IN ('dispatched', 'waiting_local_directory')
+      AND (
+        t.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
+        OR EXISTS (
+          SELECT 1 FROM issue ev_i
+          JOIN workspace ev_w ON ev_w.id=ev_i.workspace_id
+          JOIN agent ev_a ON ev_a.id=t.agent_id AND ev_a.workspace_id=ev_i.workspace_id
+          WHERE ev_i.id=t.issue_id AND ev_i.workspace_id=r.workspace_id
+            AND issue_effective_status(ev_i.workspace_id, ev_i.status)
+                IN ('todo','in_progress')
+            AND ev_i.assignee_type='agent' AND ev_i.assignee_id=t.agent_id
+            AND ev_i.triage_state IS NULL
+            AND ev_a.runtime_id=t.runtime_id
+            AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(
+                COALESCE(ev_w.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                WITH ORDINALITY AS ea(agent_id,idx)
+              JOIN jsonb_array_elements_text(
+                COALESCE(ev_w.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+              WHERE ea.agent_id=t.agent_id::text
+                AND er.runtime_id=t.runtime_id::text
+            )
+        )
+      )
     FOR UPDATE OF t
 ), capability AS (
     INSERT INTO task_supplement_capability (task_id, workspace_id, issue_id, capability)
