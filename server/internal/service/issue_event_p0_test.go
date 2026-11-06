@@ -131,3 +131,72 @@ func TestNativeOracleIssueEventStartVsWorkspaceRevoke(t *testing.T) {
 		t.Fatalf("revoked event started %d native Tasks", got)
 	}
 }
+
+
+ // TestNativeOracleClaimStartVsIssueClose exercises the real claim-token
+ // service entrypoint, not only the generated Start SQL. A concurrent Issue
+ // close holds its Issue row before it cancels the native queued Task.
+func TestNativeOracleClaimStartVsIssueClose(t *testing.T) {
+	f, taskID, _, runtimeID := nativeEventStartFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	var issueID pgtype.UUID
+	var dispatchedAt pgtype.Timestamptz
+	f.QueryRow(t,
+		"SELECT issue_id, dispatched_at FROM agent_task_queue WHERE id=$1",
+		taskID).Scan(&issueID, &dispatchedAt)
+	claim := db.LockAgentTaskStartClaimParams{
+		ID: util.MustParseUUID(taskID),
+		RuntimeID: util.MustParseUUID(runtimeID),
+		DispatchedAt: dispatchedAt,
+	}
+
+	tx, err := f.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	qtx := f.q.WithTx(tx)
+	closed, err := qtx.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
+		ID: issueID, WorkspaceID: util.MustParseUUID(f.WorkspaceID),
+		Status: "done",
+	})
+	if err != nil {
+		t.Fatalf("close Issue: %v", err)
+	}
+	started := make(chan error, 1)
+	go func() {
+		_, startErr := f.svc.TaskSvc.StartTaskForClaim(ctx, claim)
+		started <- startErr
+	}()
+	select {
+	case startErr := <-started:
+		t.Fatalf("Start returned before close committed: %v", startErr)
+	case <-time.After(120*time.Millisecond):
+		// Start is expected to wait on the original Issue lock.
+	}
+	cancelled, err := StopClosedIssueWakeups(ctx, qtx, closed)
+	if err != nil {
+		t.Fatalf("cancel unstarted task while Start waits: %v", err)
+	}
+	if len(cancelled) != 1 {
+		t.Fatalf("cancelled %d tasks; want exactly one", len(cancelled))
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit Issue close: %v", err)
+	}
+	select {
+	case startErr := <-started:
+		if !errors.Is(startErr, pgx.ErrNoRows) {
+			t.Fatalf("stale claim after close = %v; want no rows", startErr)
+		}
+	case <-ctx.Done():
+		t.Fatalf("Start and close did not finish: %v", ctx.Err())
+	}
+	if got := f.Count(t,
+		"SELECT count(*) FROM agent_task_queue WHERE id=$1 AND status='cancelled' AND started_at IS NULL",
+		taskID); got != 1 {
+		t.Fatalf("closed Issue left %d safely cancelled Tasks; want one", got)
+	}
+}
