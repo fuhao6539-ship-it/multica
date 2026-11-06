@@ -366,7 +366,7 @@ FOR UPDATE;
 DELETE FROM task_supplement
 WHERE comment_id = @comment_id AND workspace_id = @workspace_id;
 
--- name: LockNativeOracleEventIssueBeforeTaskStart :exec
+-- name: LockNativeOracleEventIssueBeforeTaskStart :many
 -- The existing Issue-close transaction locks Issue then cancels unstarted Tasks.
 -- Preserve that order for native Oracle event Start, including both old and
 -- claim-token Start APIs. Ordinary Tasks match zero rows and retain their path.
