@@ -188,6 +188,12 @@ func (s *IssueWakeupService) nativeEventTargets(ctx context.Context, ws nativeEv
 		if agent.RuntimeID != expectedRuntime {
 			continue
 		}
+		// An online non-Oracle Runtime must never silently join this
+		// unattended Oracle-only flow.
+		rt, err := s.Tasks.Queries.GetAgentRuntime(ctx, agent.RuntimeID)
+		if err != nil || rt.WorkspaceID != ws.id || rt.Provider != nativeOracleACPProvider {
+			continue
+		}
 
 		if s.authorize(ctx, s.Tasks.Queries, ws.id, actor, agent) != nil {
 			continue
@@ -257,6 +263,15 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if !bound {
 		return zero, false, nil
 	}
+	// Reuse the original member/invocation policy inside this native
+	// enqueue transaction, rather than only a prior target-list read.
+	q := s.Tasks.Queries.WithTx(tx)
+	if err = s.authorize(ctx, q, agent.WorkspaceID, actor, agent); err != nil {
+		if errors.Is(err, ErrWakeupForbidden) {
+			return zero, false, nil
+		}
+		return zero, false, err
+	}
 	// Rely on the existing native owner and Issue row locks below.
 	var ok bool
 	if err = tx.QueryRow(ctx, "SELECT lock_task_owner_rows($1,$2,$3)",
@@ -277,7 +292,6 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 		}
 		return zero, false, err
 	}
-	q := s.Tasks.Queries.WithTx(tx)
 	issue, err := q.GetIssue(ctx, issueID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return zero, false, nil
