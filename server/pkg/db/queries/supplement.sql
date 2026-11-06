@@ -373,7 +373,7 @@ WHERE comment_id = @comment_id AND workspace_id = @workspace_id;
 -- A stale Task identity is rechecked by LockAgentTaskStartClaim afterward.
 SELECT i.id FROM agent_task_queue t
 JOIN issue i ON i.id=t.issue_id
-WHERE t.id=@task_id
+WHERE t.id=$1::uuid
   AND t.context->>'oracle_issue_event'='true'
   AND t.status IN ('dispatched','waiting_local_directory')
 FOR SHARE OF i;
