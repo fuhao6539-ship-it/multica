@@ -299,7 +299,27 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if err != nil {
 		return zero, false, err
 	}
-	if issue.WorkspaceID != agent.WorkspaceID {
+	if issue.WorkspaceID != agent.WorkspaceID || issue.Revision != original.Revision {
+		// Provenance, overlay and review SHA were computed for the original
+		// Issue revision outside this short transaction. Never enqueue a
+		// mixed-version Task; the native Tick will retry fresh.
+		return zero, false, nil
+	}
+	// The owner/runtime/permission observed when building the MCP overlay
+	// must still describe the same Agent after the owner-row locks.
+	currentAgent, err := q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: agent.ID, WorkspaceID: agent.WorkspaceID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return zero, false, nil
+	}
+	if err != nil {
+		return zero, false, err
+	}
+	if currentAgent.UpdatedAt.Valid != agent.UpdatedAt.Valid ||
+		!currentAgent.UpdatedAt.Time.Equal(agent.UpdatedAt.Time) ||
+		currentAgent.RuntimeID != agent.RuntimeID ||
+		currentAgent.OwnerID != agent.OwnerID ||
+		currentAgent.PermissionMode != agent.PermissionMode ||
+		currentAgent.ArchivedAt.Valid {
 		return zero, false, nil
 	}
 	category, err := issuestatus.CategoryWithError(ctx, q, issue.WorkspaceID, issue.Status)
