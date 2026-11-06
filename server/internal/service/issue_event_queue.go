@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/attribution"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -142,8 +143,8 @@ func (s *IssueWakeupService) nativePendingIssues(ctx context.Context, ws pgtype.
  AND issue_effective_status(i.workspace_id,i.status) IN ('todo','in_progress')
  AND i.assignee_type='agent' AND i.assignee_id=ANY($3::uuid[])
  AND i.triage_state IS NULL
- AND NOT EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=i.id
-   AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
+  AND NOT EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=i.id
+    AND t.agent_id=i.assignee_id AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
  -- Terminal Task failures are consumed by the original retry mechanism;
  -- do not mint a fresh attempt=1 Task after an exhausted/nonretryable failure.
  AND COALESCE((SELECT t.status FROM agent_task_queue t
@@ -208,6 +209,23 @@ func (s *IssueWakeupService) nativeEventTargets(ctx context.Context, ws nativeEv
 func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueID pgtype.UUID,
 	agent db.Agent, actor pgtype.UUID) (db.AgentTaskQueue, bool, error) {
 	var zero db.AgentTaskQueue
+	// Resolve the native provenance and runtime overlay BEFORE taking DB locks.
+	// An unattended event is not a fresh human click by the config actor.
+	original, err := s.Tasks.Queries.GetIssue(ctx, issueID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return zero, false, nil
+	}
+	if err != nil {
+		return zero, false, err
+	}
+	attr := s.Tasks.attributionForIssueTask(ctx, original, pgtype.UUID{}, attribution.SourceCommentSource, pgtype.UUID{})
+	attr, err = s.Tasks.applyAttributionFallback(ctx, attr, agent)
+	if err != nil {
+		return zero, false, err
+	}
+	overlay := s.Tasks.buildRuntimeMCPOverlay(ctx, attr.UserID, agent)
+	attrSource, delegatedFrom, evidenceKind, evidenceRef := attributionCreateParams(attr)
+	head := headShaText(s.Tasks.ResolveIssueReviewSHA(ctx, issueID))
 	tx, err := s.Tasks.TxStarter.Begin(ctx)
 	if err != nil {
 		return zero, false, err
@@ -238,16 +256,7 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if !bound {
 		return zero, false, nil
 	}
-	// Transaction-local advisory lock shared with the native Claim guard.
-	var issueLock bool
-	if err = tx.QueryRow(ctx,
-		"SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, 2746))",
-		issueID).Scan(&issueLock); err != nil {
-		return zero, false, err
-	}
-	if !issueLock {
-		return zero, false, nil
-	}
+	// Rely on the existing native owner and Issue row locks below.
 	var ok bool
 	if err = tx.QueryRow(ctx, "SELECT lock_task_owner_rows($1,$2,$3)",
 		agent.ID, issueID, agent.RuntimeID).Scan(&ok); err != nil {
@@ -302,23 +311,25 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if failedTerminal {
 		return zero, false, nil
 	}
+	// Multica's existing per-(Issue, Agent) Task uniqueness remains authoritative.
 	var occupied bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_task_queue
-  WHERE issue_id=$1 AND status IN
-  ('queued','dispatched','running','deferred','waiting_local_directory'))`, issueID).Scan(&occupied)
+   WHERE issue_id=$1 AND agent_id=$2 AND status IN
+   ('queued','dispatched','running','deferred','waiting_local_directory'))`, issueID, agent.ID).Scan(&occupied)
 	if err != nil {
 		return zero, false, err
 	}
 	if occupied {
 		return zero, false, nil
 	}
-	overlay := s.Tasks.buildRuntimeMCPOverlay(ctx, actor, agent)
 	task, err := q.CreateAgentTask(ctx, db.CreateAgentTaskParams{
 		ID: dbid.NewV7(), AgentID: agent.ID, RuntimeID: agent.RuntimeID,
 		IssueID: issueID, Priority: priorityToInt(issue.Priority),
 		TriggerSummary:   pgtype.Text{String: "Native unfinished-Issue event", Valid: true},
-		OriginatorUserID: actor, AccountableUserID: actor,
-		OriginatorSource:  pgtype.Text{String: "trigger_owner", Valid: true},
+		OriginatorUserID: attr.UserID, AccountableUserID: attr.AccountableUserID,
+		OriginatorSource: attrSource, DelegatedFromTaskID: delegatedFrom,
+		TriggerEvidenceKind: evidenceKind, TriggerEvidenceRefID: evidenceRef,
+		RuleVersionID: attr.RuleVersionID, HeadSha: head,
 		RuntimeMcpOverlay: overlay.Overlay, RuntimeConnectedApps: overlay.ConnectedApps,
 	})
 	if err != nil {

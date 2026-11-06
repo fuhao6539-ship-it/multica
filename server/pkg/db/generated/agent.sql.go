@@ -1574,18 +1574,22 @@ WHERE id = (
       AND (atq.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
            OR EXISTS (SELECT 1 FROM issue ev_i JOIN workspace ev_w
                       ON ev_w.id=ev_i.workspace_id WHERE ev_i.id=atq.issue_id
-                        AND issue_effective_status(ev_i.workspace_id,ev_i.status)
-                            NOT IN ('done','cancelled')
-                        AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'))
-      -- Preserve normal parallel agents unless either side participates in the
-      -- single-consumer Oracle Issue event flow.
-      AND NOT EXISTS (
-          SELECT 1 FROM agent_task_queue event_busy
-          WHERE event_busy.issue_id=atq.issue_id AND event_busy.id<>atq.id
-            AND event_busy.status IN ('dispatched','running','waiting_local_directory')
-            AND (atq.context->>'oracle_issue_event'='true'
-                 OR event_busy.context->>'oracle_issue_event'='true')
-      )
+                         AND issue_effective_status(ev_i.workspace_id,ev_i.status)
+                             IN ('todo','in_progress')
+                         AND ev_i.assignee_type='agent'
+                         AND ev_i.assignee_id=atq.agent_id
+                         AND ev_i.triage_state IS NULL
+                         AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'
+                         AND EXISTS (
+                           SELECT 1 FROM jsonb_array_elements_text(
+                             COALESCE(ev_w.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                             WITH ORDINALITY AS ea(agent_id,idx)
+                           JOIN jsonb_array_elements_text(
+                             COALESCE(ev_w.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                             WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+                           WHERE ea.agent_id=atq.agent_id::text
+                             AND er.runtime_id=atq.runtime_id::text
+                         )))
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
           WHERE active.agent_id = atq.agent_id
