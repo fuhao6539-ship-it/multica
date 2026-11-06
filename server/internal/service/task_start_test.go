@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +14,15 @@ type startReplayDB struct {
 	mockDBTX
 	startErr error
 	calls    int
+}
+
+// A normal Task has no event Issue to pre-lock. Model PostgreSQL SELECT :many
+// as a successful empty result, not ErrNoRows (which pgx Query does not emit).
+func (m *startReplayDB) Query(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, "LockNativeOracleEventIssueBeforeTaskStart") {
+		return &sliceRows{}, nil
+	}
+	return nil, pgx.ErrNoRows
 }
 
 func (m *startReplayDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
