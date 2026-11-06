@@ -7904,6 +7904,25 @@ WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
       AND atq.status = 'dispatched'
+      AND (atq.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
+        OR EXISTS (
+          SELECT 1 FROM issue ri JOIN workspace rw ON rw.id=ri.workspace_id
+          JOIN agent ra ON ra.id=atq.agent_id AND ra.workspace_id=ri.workspace_id
+          WHERE ri.id=atq.issue_id
+            AND issue_effective_status(ri.workspace_id,ri.status) IN ('todo','in_progress')
+            AND ri.assignee_type='agent' AND ri.assignee_id=atq.agent_id
+            AND ri.triage_state IS NULL AND ra.runtime_id=atq.runtime_id
+            AND rw.settings->'oracle_issue_events'->>'enabled'='true'
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                WITH ORDINALITY AS ea(agent_id,idx)
+              JOIN jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+              WHERE ea.agent_id=atq.agent_id::text AND er.runtime_id=atq.runtime_id::text
+            )
+        ))
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
@@ -8028,6 +8047,25 @@ WITH candidates AS MATERIALIZED (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = ANY($2::uuid[])
       AND atq.status = 'dispatched'
+      AND (atq.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
+        OR EXISTS (
+          SELECT 1 FROM issue ri JOIN workspace rw ON rw.id=ri.workspace_id
+          JOIN agent ra ON ra.id=atq.agent_id AND ra.workspace_id=ri.workspace_id
+          WHERE ri.id=atq.issue_id
+            AND issue_effective_status(ri.workspace_id,ri.status) IN ('todo','in_progress')
+            AND ri.assignee_type='agent' AND ri.assignee_id=atq.agent_id
+            AND ri.triage_state IS NULL AND ra.runtime_id=atq.runtime_id
+            AND rw.settings->'oracle_issue_events'->>'enabled'='true'
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                WITH ORDINALITY AS ea(agent_id,idx)
+              JOIN jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+              WHERE ea.agent_id=atq.agent_id::text AND er.runtime_id=atq.runtime_id::text
+            )
+        ))
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
