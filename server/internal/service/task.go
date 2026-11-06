@@ -4420,6 +4420,9 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID, capabil
 	var task db.AgentTaskQueue
 	var change *qoderIssueChange
 	err := s.runInTx(ctx, func(q *db.Queries) error {
+		if err := q.LockNativeOracleEventIssueBeforeTaskStart(ctx, taskID); err != nil {
+			return fmt.Errorf("lock event Issue before start: %w", err)
+		}
 		var err error
 		task, err = q.StartAgentTaskWithSupplement(ctx, db.StartAgentTaskWithSupplementParams{TaskID: taskID, EnableTaskSupplement: offered.Supplement, EnableProcessCleanup: offered.ProcessCleanup})
 		if err != nil {
@@ -4449,6 +4452,12 @@ func (s *TaskService) StartTaskForClaim(ctx context.Context, claim db.LockAgentT
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+	// The original close transition holds Issue before it cancels Task.
+	// Acquiring that same Issue lock first closes the Task->Issue deadlock
+	// without changing native claim/replay CAS or normal Task behavior.
+	if err := qtx.LockNativeOracleEventIssueBeforeTaskStart(ctx, claim.ID); err != nil {
+		return nil, fmt.Errorf("lock event Issue before claim start: %w", err)
+	}
 	task, err := qtx.LockAgentTaskStartClaim(ctx, claim)
 	if err != nil {
 		return nil, fmt.Errorf("lock task start claim: %w", err)
