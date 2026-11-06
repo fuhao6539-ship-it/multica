@@ -694,6 +694,24 @@ func (q *Queries) ListUndeliveredTaskSupplementCommentIDs(ctx context.Context, t
 	return items, nil
 }
 
+const lockNativeOracleEventIssueBeforeTaskStart = `-- name: LockNativeOracleEventIssueBeforeTaskStart :exec
+SELECT i.id FROM agent_task_queue t
+JOIN issue i ON i.id=t.issue_id
+WHERE t.id=@task_id
+  AND t.context->>'oracle_issue_event'='true'
+  AND t.status IN ('dispatched','waiting_local_directory')
+FOR SHARE OF i
+`
+
+// The existing Issue-close transaction locks Issue then cancels unstarted Tasks.
+// Preserve that order for native Oracle event Start, including both old and
+// claim-token Start APIs. Ordinary Tasks match zero rows and retain their path.
+// A stale Task identity is rechecked by LockAgentTaskStartClaim afterward.
+func (q *Queries) LockNativeOracleEventIssueBeforeTaskStart(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, lockNativeOracleEventIssueBeforeTaskStart)
+	return err
+}
+
 const lockTaskForSupplementBind = `-- name: LockTaskForSupplementBind :one
 SELECT id FROM agent_task_queue WHERE id = $1 FOR UPDATE
 `
@@ -996,20 +1014,3 @@ func (q *Queries) StartAgentTaskWithSupplement(ctx context.Context, arg StartAge
 	)
 	return i, err
 }
-
-const lockNativeOracleEventIssueBeforeTaskStart = `-- name: LockNativeOracleEventIssueBeforeTaskStart :exec
-SELECT i.id FROM agent_task_queue t
-JOIN issue i ON i.id=t.issue_id
-WHERE t.id=$1
-  AND t.context->>'oracle_issue_event'='true'
-  AND t.status IN ('dispatched','waiting_local_directory')
-FOR SHARE OF i
-`
-
-// Event starts lock their existing Issue before their existing Task row.
-// This matches Issue-close cancellation order without affecting other Tasks.
-func (q *Queries) LockNativeOracleEventIssueBeforeTaskStart(ctx context.Context, taskID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, lockNativeOracleEventIssueBeforeTaskStart, taskID)
-	return err
-}
-
