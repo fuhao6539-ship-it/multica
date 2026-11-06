@@ -694,10 +694,10 @@ func (q *Queries) ListUndeliveredTaskSupplementCommentIDs(ctx context.Context, t
 	return items, nil
 }
 
-const lockNativeOracleEventIssueBeforeTaskStart = `-- name: LockNativeOracleEventIssueBeforeTaskStart :exec
+const lockNativeOracleEventIssueBeforeTaskStart = `-- name: LockNativeOracleEventIssueBeforeTaskStart :many
 SELECT i.id FROM agent_task_queue t
 JOIN issue i ON i.id=t.issue_id
-WHERE t.id=@task_id
+WHERE t.id=$1::uuid
   AND t.context->>'oracle_issue_event'='true'
   AND t.status IN ('dispatched','waiting_local_directory')
 FOR SHARE OF i
@@ -707,9 +707,24 @@ FOR SHARE OF i
 // Preserve that order for native Oracle event Start, including both old and
 // claim-token Start APIs. Ordinary Tasks match zero rows and retain their path.
 // A stale Task identity is rechecked by LockAgentTaskStartClaim afterward.
-func (q *Queries) LockNativeOracleEventIssueBeforeTaskStart(ctx context.Context) error {
-	_, err := q.db.Exec(ctx, lockNativeOracleEventIssueBeforeTaskStart)
-	return err
+func (q *Queries) LockNativeOracleEventIssueBeforeTaskStart(ctx context.Context, dollar_1 pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, lockNativeOracleEventIssueBeforeTaskStart, dollar_1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockTaskForSupplementBind = `-- name: LockTaskForSupplementBind :one
