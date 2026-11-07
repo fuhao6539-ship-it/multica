@@ -915,10 +915,10 @@ WITH candidate AS MATERIALIZED (
             AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'
             AND EXISTS (
               SELECT 1 FROM jsonb_array_elements_text(
-                COALESCE(ev_w.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                (CASE WHEN jsonb_typeof(ev_w.settings#>'{oracle_issue_events,agent_ids}')='array' THEN ev_w.settings#>'{oracle_issue_events,agent_ids}' ELSE '[]'::jsonb END))
                 WITH ORDINALITY AS ea(agent_id,idx)
               JOIN jsonb_array_elements_text(
-                COALESCE(ev_w.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                (CASE WHEN jsonb_typeof(ev_w.settings#>'{oracle_issue_events,runtime_ids}')='array' THEN ev_w.settings#>'{oracle_issue_events,runtime_ids}' ELSE '[]'::jsonb END))
                 WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
               WHERE ea.agent_id=t.agent_id::text
                 AND er.runtime_id=t.runtime_id::text
