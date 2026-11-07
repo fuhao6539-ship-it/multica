@@ -406,3 +406,66 @@ func TestIssueWakeupConcurrentDispatchIsIdempotent(t *testing.T) {
 		t.Fatalf("created %d runs", n)
 	}
 }
+
+
+// Concurrent dispatches from different wakeup rules must share the Issue-level
+// single-flight fence, not merely the same wakeup_id. This is a regression
+// against the production every-rule creating a queued Task while another
+// Task for the same Issue was still running (CCY1-2746, 2026-11-07).
+func TestIssueWakeupConcurrentAcrossRulesSingleFlight(t *testing.T) {
+	f, s, issue, agent := wakeFixture(t)
+	event := wakeCreate(t, f, s, issue, WakeupInput{
+		AgentID: agent, Kind: "event", Mode: "continuous",
+		EventTypes: []string{"comment.created"}, Instruction: "event subscriber",
+	})
+	timer := wakeCreate(t, f, s, issue, WakeupInput{
+		AgentID: agent, Kind: "every", Mode: "continuous",
+		IntervalSeconds: 360, Instruction: "periodic fallback",
+	})
+	f.Comment(t, util.UUIDToString(issue), "concurrent wakeup input")
+	f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1", timer.ID)
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, rule := range []db.IssueWakeup{event, timer} {
+		rule := rule
+		wg.Go(func() {
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			results <- s.dispatch(ctx, rule)
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case !isLockTimeout(err):
+			t.Errorf("unexpected concurrent dispatch failure: %v", err)
+		}
+	}
+	if successes == 0 {
+		t.Fatal("no concurrent wakeup dispatch succeeded")
+	}
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1", issue); n != 1 {
+		t.Fatalf("two wakeup rules created %d Tasks for the same Issue", n)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND status IN ('queued','deferred','dispatched','running','waiting_local_directory')", issue); n != 1 {
+		t.Fatalf("expected one active Task across concurrent wakeup rules, got %d", n)
+	}
+
+	// After the winner begins running, the next timer tick must not add
+	// a second Task. The timer rule stays enabled for future cycles.
+	f.Exec(t, "UPDATE agent_task_queue SET status='running',started_at=now() WHERE issue_id=$1 AND status='queued'", issue)
+	f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1", timer.ID)
+	wakeDispatch(t, s, timer)
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND status IN ('queued','deferred','dispatched','running','waiting_local_directory')", issue); n != 1 {
+		t.Fatalf("timer created a duplicate while prior Issue Task was running: %d", n)
+	}
+}
