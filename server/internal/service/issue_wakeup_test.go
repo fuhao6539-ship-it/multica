@@ -182,13 +182,21 @@ func TestIssueWakeupContinuousSelfLoopAndClose(t *testing.T) {
 	}
 	f.Comment(t, util.UUIDToString(issue), "two")
 	wakeDispatch(t, s, w)
-	f.Comment(t, util.UUIDToString(issue), "three")
+	thirdCommentID := f.Comment(t, util.UUIDToString(issue), "three")
 	wakeDispatch(t, s, w)
 	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE context->>'wakeup_id'=$1 AND status='queued'", util.UUIDToString(w.ID)); n != 0 {
 		t.Fatalf("a running Issue must not get a second queued wakeup: %d", n)
 	}
-	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 2 {
-		t.Fatalf("external event inputs must be preserved while the Issue runs: %d", n)
+	// Pending comment receipts are coalesced: two independent external
+	// comments may share one row, but their total count must survive.
+	if n := f.Count(t, "SELECT COALESCE(SUM(COALESCE((payload->>'coalesced_count')::bigint, 1)), 0) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL AND event_type='comment.created'", w.ID); n != 2 {
+		t.Fatalf("both external event inputs must be preserved through coalescing: %d", n)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL AND payload->>'comment_id'=$2", w.ID, thirdCommentID); n != 1 {
+		t.Fatalf("the newest external comment was lost during receipt coalescing: %d", n)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NOT NULL AND event_type='comment.created'", w.ID); n != 1 {
+		t.Fatalf("the first triggering comment was not consumed exactly once: %d", n)
 	}
 	f.Insert(t, "issue_status", testutil.Cols{"workspace_id": f.WorkspaceID, "key": "finished", "name": "Finished", "category": "done", "color": "#000000"})
 	cancelled := wakeSetStatus(t, f, issue, "finished")

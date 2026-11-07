@@ -1270,8 +1270,16 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 			return err
 		}
 		if waiting {
-			// As while its own run is claimed: timers advance, inputs stay,
-			// and a once rule stays on until its input is handed over.
+			// A periodic tick already covered by this Issue's pending Task
+			// must not linger as an unprocessed follow-up after that Task ends.
+			// Unlike external event receipts, a timer needs no join evidence.
+			if w.Kind == "every" || w.Kind == "cron" {
+				if err = q.ConsumeWakeupReceipts(ctx, db.ConsumeWakeupReceiptsParams{Ids: ids}); err != nil {
+					return err
+				}
+			}
+			// External events and once rules still keep inputs for the
+			// waiting Task, so native JoinWaitingWakeups can deliver them.
 			if err = q.AdvanceIssueWakeup(ctx, db.AdvanceIssueWakeupParams{ID: w.ID, Enabled: w.Enabled, NextFireAt: next}); err != nil {
 				return err
 			}
