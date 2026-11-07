@@ -404,9 +404,38 @@ func nativeEventRecipient(targets []nativeEventTarget, issue db.Issue) db.Agent 
 	return targets[0].agent
 }
 
-// After the original Task terminal event, enqueue at most one native successor
-// for the same Issue, then existing NotifyTaskEnqueued wakes Oracle. Oracle
-// owns the concurrency slots. The leased Tick remains a crash-recovery fallback.
+// A completed Task releases its Issue, but it does not grant that Issue
+// exclusive use of the next Oracle slot. Select from the existing workspace
+// Issue pool by native priority/age, using the same transactional enqueue gate.
+func (s *IssueWakeupService) enqueueNextPendingNativeIssue(ctx context.Context,
+	workspaceID pgtype.UUID, targets []nativeEventTarget, actor pgtype.UUID) (bool, error) {
+	ids, err := s.nativePendingIssues(ctx, workspaceID, targets)
+	if err != nil {
+		return false, err
+	}
+	var errs []error
+	for _, id := range ids {
+		issue, lookupErr := s.Tasks.Queries.GetIssue(ctx, id)
+		if lookupErr != nil {
+			errs = append(errs, lookupErr)
+			continue
+		}
+		_, enqueued, enqueueErr := s.enqueueNativeIssueEvent(ctx, id,
+			nativeEventRecipient(targets, issue), actor)
+		if enqueueErr != nil {
+			errs = append(errs, enqueueErr)
+			continue
+		}
+		if enqueued {
+			return true, nil
+		}
+	}
+	return false, errors.Join(errs...)
+}
+
+// After any original Task terminal event, refill from ALL eligible Issue
+// events in this workspace, not unconditionally from the just-finished Issue.
+// The current Task queue/Claim/Lease remains the only execution machinery.
 func (s *TaskService) dispatchNativeIssueSuccessor(issueID pgtype.UUID) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -426,16 +455,17 @@ func (s *TaskService) dispatchNativeIssueSuccessor(issueID pgtype.UUID) {
 		return
 	}
 	wakeup := IssueWakeupService{Tasks: s}
-	targets, actor, err := wakeup.nativeEventTargets(ctx, nativeEventWorkspace{id: issue.WorkspaceID, config: cfg})
+	targets, actor, err := wakeup.nativeEventTargets(ctx,
+		nativeEventWorkspace{id: issue.WorkspaceID, config: cfg})
 	if err != nil || len(targets) == 0 {
 		return
 	}
-	// Reuse the one original transaction that verifies Issue status, active
-	// Task dedup, workspace binding and claim ownership; no second eligibility
-	// decision, runtime slot count or Task database.
-	if _, _, err = wakeup.enqueueNativeIssueEvent(ctx, issueID, nativeEventRecipient(targets, issue), actor); err != nil {
-		slog.Warn("native issue continuation enqueue failed; leased Tick will retry",
-			"issue_id", util.UUIDToString(issueID), "error", err)
+	// Queueing remains transactional and race-safe. If no candidate can be
+	// inserted, the existing leased Tick is the normal recovery fallback.
+	if _, err = wakeup.enqueueNextPendingNativeIssue(ctx, issue.WorkspaceID,
+		targets, actor); err != nil {
+		slog.Warn("native issue continuation refill failed; leased Tick will retry",
+			"source_issue_id", util.UUIDToString(issueID), "error", err)
 	}
 }
 
