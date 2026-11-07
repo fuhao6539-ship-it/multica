@@ -147,8 +147,9 @@ func (s *IssueWakeupService) nativePendingIssues(ctx context.Context, ws pgtype.
     AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
  -- Terminal Task failures are consumed by the original retry mechanism;
  -- do not mint a fresh attempt=1 Task after an exhausted/nonretryable failure.
+ -- A subsequently cancelled unstarted duplicate is not explicit recovery.
  AND COALESCE((SELECT t.status FROM agent_task_queue t
-   WHERE t.issue_id=i.id
+   WHERE t.issue_id=i.id AND t.status<>'cancelled'
     ORDER BY t.created_at DESC,t.id DESC LIMIT 1),'')<>'failed'
  ORDER BY
    CASE i.priority WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
@@ -338,7 +339,7 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	// never reset attempt=1 just because the Issue is still unfinished.
 	var failedTerminal bool
 	err = tx.QueryRow(ctx, `SELECT COALESCE((SELECT t.status='failed'
-	  FROM agent_task_queue t WHERE t.issue_id=$1
+	  FROM agent_task_queue t WHERE t.issue_id=$1 AND t.status<>'cancelled'
 	  ORDER BY t.created_at DESC,t.id DESC LIMIT 1),false)`, issueID).Scan(&failedTerminal)
 	if err != nil {
 		return zero, false, err
