@@ -1,10 +1,13 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
-)
 
+	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
+)
 func TestNativeIssueEventWorkspaceOptIn(t *testing.T) {
 	good := map[string]any{"oracle_issue_events": map[string]any{
 		"enabled":       true,
@@ -64,5 +67,37 @@ func TestNativeEventQueueAllUnfinishedRemainEvents(t *testing.T) {
 	waiting--
 	if waiting != 984 {
 		t.Fatal("terminal Issue was requeued")
+	}
+}
+
+func TestNativeIssueEventPriorityBeforePreviousCompletion(t *testing.T) {
+	f, wakeup, _, agentID := wakeFixture(t)
+	ctx := context.Background()
+	ws := parseTestUUID(t, f.WorkspaceID)
+	agent, err := f.q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID: parseTestUUID(t, agentID), WorkspaceID: ws,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	high := f.Issue(t, "High without a previous Task")
+	urgent := f.Issue(t, "Urgent with a completed Task")
+	for _, item := range []struct {
+		id, priority string
+	}{{high, "high"}, {urgent, "urgent"}} {
+		f.Exec(t, "UPDATE issue SET status='todo',priority=$2,assignee_type='agent',assignee_id=$3,triage_state=NULL WHERE id=$1",
+			item.id, item.priority, agentID)
+	}
+	f.Task(t, agentID, testutil.Cols{
+		"issue_id": urgent, "status": "completed",
+		"completed_at": testutil.Raw("now()"),
+		"runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agentID + "')"),
+	})
+	ids, err := wakeup.nativePendingIssues(ctx, ws, []nativeEventTarget{{agent: agent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) < 2 || ids[0] != parseTestUUID(t, urgent) || ids[1] != parseTestUUID(t, high) {
+		t.Fatalf("urgent must precede high even with a recent completion; got %v", ids)
 	}
 }

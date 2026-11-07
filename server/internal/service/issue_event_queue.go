@@ -151,8 +151,8 @@ func (s *IssueWakeupService) nativePendingIssues(ctx context.Context, ws pgtype.
    WHERE t.issue_id=i.id AND t.agent_id=i.assignee_id
     ORDER BY t.created_at DESC,t.id DESC LIMIT 1),'')<>'failed'
  ORDER BY
-   COALESCE((SELECT MAX(t.completed_at) FROM agent_task_queue t WHERE t.issue_id=i.id),to_timestamp(0)) ASC,
    CASE i.priority WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+   COALESCE((SELECT MAX(t.completed_at) FROM agent_task_queue t WHERE t.issue_id=i.id),to_timestamp(0)) ASC,
    i.created_at,i.id LIMIT $2::integer`, ws, int32(nativeEventBatchSize), agentIDs)
 	if err != nil {
 		return nil, err
