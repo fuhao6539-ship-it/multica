@@ -247,3 +247,60 @@ func TestNativeIssueEventTerminalRefillPrioritizesAnotherIssue(t *testing.T) {
 		t.Fatalf("completed lower-priority Issue reclaimed %d queued Tasks", got)
 	}
 }
+// TestNativeIssueEventWakeupReservationAndRecovery proves that the existing
+// enabled Wakeup is itself the single-flight reservation, including before
+// its first Run and after a generic queued Task was created.
+func TestNativeIssueEventWakeupReservationAndRecovery(t *testing.T) {
+	f, wakeup, issue, agentID := wakeFixture(t)
+	ctx := context.Background()
+	ws := parseTestUUID(t, f.WorkspaceID)
+	var runtimeID string
+	f.QueryRow(t, "SELECT runtime_id::text FROM agent WHERE id=$1", agentID).Scan(&runtimeID)
+	f.Exec(t, "UPDATE agent_runtime SET provider='hermes' WHERE id=$1", runtimeID)
+	f.Exec(t, "UPDATE issue SET status='todo',assignee_type='agent',assignee_id=$2,triage_state=NULL WHERE id=$1", issue, agentID)
+	f.Exec(t, `UPDATE workspace SET settings=jsonb_set(
+		COALESCE(settings,'{}'::jsonb),'{oracle_issue_events}',
+		jsonb_build_object('enabled',true,'actor_user_id',$2::text,
+		  'agent_ids',jsonb_build_array($3::text),
+		  'runtime_ids',jsonb_build_array($4::text)),true)
+		WHERE id=$1`, f.WorkspaceID, f.UserID, agentID, runtimeID)
+	agent, err := f.q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID: parseTestUUID(t, agentID), WorkspaceID: ws,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	isPending := func() bool {
+		ids, e := wakeup.nativePendingIssues(ctx, ws, []nativeEventTarget{{agent: agent}})
+		if e != nil { t.Fatal(e) }
+		for _, id := range ids {
+			if id == issue { return true }
+		}
+		return false
+	}
+	if !isPending() { t.Fatal("new unfinished Issue absent before registering Wakeup") }
+	w := wakeCreate(t, f, wakeup, issue, WakeupInput{
+		AgentID: agentID, Kind: "event", EventTypes: []string{"comment.created"},
+		Instruction: "Use the existing event subscription",
+	})
+	if isPending() { t.Fatal("enabled untriggered Wakeup did not reserve the Issue") }
+	_, inserted, err := wakeup.enqueueNativeIssueEvent(ctx, issue, agent, parseTestUUID(t, f.UserID))
+	if err != nil || inserted {
+		t.Fatalf("transactional enqueue ignored Wakeup reservation: inserted=%v err=%v", inserted, err)
+	}
+	// A disabled rule stops reserving the Issue. Re-enable after the generic
+	// Task is queued; the native recovery pass must cancel only unstarted work.
+	f.Exec(t, "UPDATE issue_wakeup SET enabled=false,disabled_at=now() WHERE id=$1", w.ID)
+	if !isPending() { t.Fatal("disabled Wakeup still blocked available Issue") }
+	queued, inserted, err := wakeup.enqueueNativeIssueEvent(ctx, issue, agent, parseTestUUID(t, f.UserID))
+	if err != nil || !inserted {
+		t.Fatalf("eligible native Task not queued: inserted=%v err=%v", inserted, err)
+	}
+	f.Exec(t, "UPDATE issue_wakeup SET enabled=true,disabled_at=NULL WHERE id=$1", w.ID)
+	if err := wakeup.RecoverOrphanedNativeEventTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE id=$1 AND status='cancelled' AND started_at IS NULL", queued.ID); got != 1 {
+		t.Fatalf("enabled Wakeup left %d superseded unstarted Tasks; want 1", got)
+	}
+}
