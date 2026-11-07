@@ -144,7 +144,7 @@ func (s *IssueWakeupService) nativePendingIssues(ctx context.Context, ws pgtype.
  AND i.assignee_type='agent' AND i.assignee_id=ANY($3::uuid[])
  AND i.triage_state IS NULL
   AND NOT EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=i.id
-    AND t.agent_id=i.assignee_id AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
+    AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
  -- Terminal Task failures are consumed by the original retry mechanism;
  -- do not mint a fresh attempt=1 Task after an exhausted/nonretryable failure.
  AND COALESCE((SELECT t.status FROM agent_task_queue t
@@ -346,11 +346,12 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if failedTerminal {
 		return zero, false, nil
 	}
-	// Multica's existing per-(Issue, Agent) Task uniqueness remains authoritative.
+	// Preserve Issue-wide occupancy across reassignment and different native Task origins.
+	// The per-(Issue, Agent) database uniqueness alone cannot exclude an older Agent's Task.
 	var occupied bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_task_queue
-   WHERE issue_id=$1 AND agent_id=$2 AND status IN
-   ('queued','dispatched','running','deferred','waiting_local_directory'))`, issueID, agent.ID).Scan(&occupied)
+   WHERE issue_id=$1 AND status IN
+   ('queued','dispatched','running','deferred','waiting_local_directory'))`, issueID).Scan(&occupied)
 	if err != nil {
 		return zero, false, err
 	}
