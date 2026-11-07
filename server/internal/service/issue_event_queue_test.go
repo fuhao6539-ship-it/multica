@@ -132,7 +132,7 @@ func TestNativeIssueEventReassignmentPreservesIssueWideInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range pending {
-		if id == parseTestUUID(t, issue) {
+		if id == issue {
 			t.Fatal("reassignment hid prior Agent's running Task and allowed duplicate queueing")
 		}
 	}
@@ -142,7 +142,7 @@ func TestNativeIssueEventReassignmentPreservesIssueWideInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, id := range pending {
-		if id == parseTestUUID(t, issue) {
+		if id == issue {
 			return
 		}
 	}
@@ -179,7 +179,7 @@ func TestNativeIssueEventReassignmentDoesNotReplayPreviousAgentFailure(t *testin
 		t.Fatal(err)
 	}
 	for _, id := range pending {
-		if id == parseTestUUID(t, issue) {
+		if id == issue {
 			t.Fatal("reassignment hid prior Agent's failed Task and made Issue auto-runnable")
 		}
 	}
@@ -194,7 +194,7 @@ func TestNativeIssueEventReassignmentDoesNotReplayPreviousAgentFailure(t *testin
 			'runtime_ids',jsonb_build_array($4::text)),true)
 		WHERE id=$1`, f.WorkspaceID, f.UserID, currentAgentID, runtimeID)
 	_, inserted, err := wakeup.enqueueNativeIssueEvent(
-		ctx, parseTestUUID(t, issue), agent, parseTestUUID(t, f.UserID))
+		ctx, issue, agent, parseTestUUID(t, f.UserID))
 	if err != nil {
 		t.Fatal(err)
 	}

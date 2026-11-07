@@ -44,7 +44,7 @@ func TestNativeIssueEventCancelledDuplicateDoesNotClearPriorFailure(t *testing.T
             t.Fatal(err)
         }
         for _, id := range ids {
-            if id == parseTestUUID(t, issue) {
+            if id == issue {
                 t.Fatal("cancelled duplicate silently cleared preceding failed Task")
             }
         }
@@ -60,7 +60,7 @@ func TestNativeIssueEventCancelledDuplicateDoesNotClearPriorFailure(t *testing.T
             'runtime_ids',jsonb_build_array($4::text)),true)
         WHERE id=$1`, f.WorkspaceID, f.UserID, agentID, runtimeID)
     _, inserted, err := wakeup.enqueueNativeIssueEvent(
-        ctx, parseTestUUID(t, issue), agent, parseTestUUID(t, f.UserID))
+        ctx, issue, agent, parseTestUUID(t, f.UserID))
     if err != nil {
         t.Fatal(err)
     }
@@ -79,7 +79,7 @@ func TestNativeIssueEventCancelledDuplicateDoesNotClearPriorFailure(t *testing.T
         t.Fatal(err)
     }
     for _, id := range ids {
-        if id == parseTestUUID(t, issue) {
+        if id == issue {
             return
         }
     }
