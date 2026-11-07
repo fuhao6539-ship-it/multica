@@ -70,10 +70,10 @@ func (s *IssueWakeupService) RecoverOrphanedNativeEventTasks(ctx context.Context
            OR COALESCE(w.settings->'oracle_issue_events'->>'enabled','false') <> 'true'
            OR NOT EXISTS (
              SELECT 1 FROM jsonb_array_elements_text(
-               COALESCE(w.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+               (CASE WHEN jsonb_typeof(w.settings#>'{oracle_issue_events,agent_ids}')='array' THEN w.settings#>'{oracle_issue_events,agent_ids}' ELSE '[]'::jsonb END))
                WITH ORDINALITY AS ea(agent_id,idx)
              JOIN jsonb_array_elements_text(
-               COALESCE(w.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+               (CASE WHEN jsonb_typeof(w.settings#>'{oracle_issue_events,runtime_ids}')='array' THEN w.settings#>'{oracle_issue_events,runtime_ids}' ELSE '[]'::jsonb END))
                WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
              WHERE ea.agent_id=t.agent_id::text AND er.runtime_id=t.runtime_id::text)
          )
