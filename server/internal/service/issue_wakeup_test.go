@@ -313,7 +313,6 @@ func TestIssueWakeupRetryKeepsPromptAndSchedulingScope(t *testing.T) {
 	f.Cleanup(t, "DELETE FROM agent_task_queue WHERE id=$1", child.ID)
 }
 
-
 // Different rules on the same Issue share one active native Task, even when
 // the periodic fallback and an event subscriber fire on adjacent ticks.
 func TestIssueWakeupAcrossRulesSingleFlight(t *testing.T) {
