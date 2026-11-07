@@ -214,6 +214,12 @@ func (s *IssueWakeupService) nativeEventTargets(ctx context.Context, ws nativeEv
 	return out, actor, nil
 }
 
+// A scheduled event is not a new authorization from the Issue originator.
+// Preserve attribution separately from per-user Connected App access.
+func nativeEventOverlayPrincipalAllowed(originator, authorizedActor pgtype.UUID) bool {
+	return originator.Valid && authorizedActor.Valid && originator == authorizedActor
+}
+
 // The authoritative lock/Issue status/active Task check and task insert are
 // one native database transaction. Source Task identity never comes from an
 // untrusted ChatGPT prompt.
@@ -234,7 +240,13 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if err != nil {
 		return zero, false, err
 	}
-	overlay := s.Tasks.buildRuntimeMCPOverlay(ctx, attr.UserID, agent)
+	// Unattended events are authorized by the configured actor, but the Issue
+	// creator may be a different member. Never attach that other member's
+	// Connected Apps without a separately proven delegation.
+	var overlay runtimeMCPOverlayData
+	if nativeEventOverlayPrincipalAllowed(attr.UserID, actor) {
+		overlay = s.Tasks.buildRuntimeMCPOverlay(ctx, attr.UserID, agent)
+	}
 	attrSource, delegatedFrom, evidenceKind, evidenceRef := attributionCreateParams(attr)
 	head := headShaText(s.Tasks.ResolveIssueReviewSHA(ctx, issueID))
 	tx, err := s.Tasks.TxStarter.Begin(ctx)
