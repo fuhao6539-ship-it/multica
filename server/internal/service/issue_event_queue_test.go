@@ -202,3 +202,48 @@ func TestNativeIssueEventReassignmentDoesNotReplayPreviousAgentFailure(t *testin
 		t.Fatal("transactional enqueue blindly replayed previous Agent's failed Task")
 	}
 }
+
+// TestNativeIssueEventTerminalRefillPrioritizesAnotherIssue is a real
+// PostgreSQL queue regression: a completed lower-priority Issue must not
+// immediately reclaim the slot while an unrelated urgent Issue is waiting.
+// Both Issue rows remain the only persistent event records.
+func TestNativeIssueEventTerminalRefillPrioritizesAnotherIssue(t *testing.T) {
+	f, wakeup, completedIssue, agentID := wakeFixture(t)
+	ctx := context.Background()
+	urgentIssue := f.Issue(t, "Unstarted urgent delivery")
+	var runtimeID string
+	f.QueryRow(t, "SELECT runtime_id::text FROM agent WHERE id=$1", agentID).Scan(&runtimeID)
+	f.Exec(t, "UPDATE agent_runtime SET provider='hermes' WHERE id=$1", runtimeID)
+	f.Exec(t, "UPDATE issue SET status='todo',priority='low',assignee_type='agent',assignee_id=$2,triage_state=NULL WHERE id=$1",
+		completedIssue, agentID)
+	f.Exec(t, "UPDATE issue SET status='todo',priority='urgent',assignee_type='agent',assignee_id=$2,triage_state=NULL WHERE id=$1",
+		urgentIssue, agentID)
+	f.Task(t, agentID, testutil.Cols{
+		"issue_id": completedIssue, "runtime_id": runtimeID,
+		"status": "completed", "completed_at": testutil.Raw("now()"),
+	})
+	f.Exec(t, `UPDATE workspace SET settings=jsonb_set(
+		COALESCE(settings,'{}'::jsonb),'{oracle_issue_events}',
+		jsonb_build_object('enabled',true,'actor_user_id',$2::text,
+			'agent_ids',jsonb_build_array($3::text),
+			'runtime_ids',jsonb_build_array($4::text)),true)
+		WHERE id=$1`, f.WorkspaceID, f.UserID, agentID, runtimeID)
+	ws := parseTestUUID(t, f.WorkspaceID)
+	agent, err := f.q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID: parseTestUUID(t, agentID), WorkspaceID: ws,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := wakeup.enqueueNextPendingNativeIssue(ctx, ws,
+		[]nativeEventTarget{{agent: agent}}, parseTestUUID(t, f.UserID))
+	if err != nil || !inserted {
+		t.Fatalf("terminal refill: inserted=%v err=%v", inserted, err)
+	}
+	if got := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND status='queued'", urgentIssue); got != 1 {
+		t.Fatalf("urgent Issue got %d queued Tasks, want 1", got)
+	}
+	if got := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND status='queued'", completedIssue); got != 0 {
+		t.Fatalf("completed lower-priority Issue reclaimed %d queued Tasks", got)
+	}
+}
