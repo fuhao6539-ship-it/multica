@@ -13,10 +13,10 @@ func TestNativeEventOverlayPrincipalAllowed(t *testing.T) {
 	creator := pgtype.UUID{Bytes: [16]byte{1}, Valid: true}
 	actor := pgtype.UUID{Bytes: [16]byte{2}, Valid: true}
 	tests := []struct {
-		name string
+		name       string
 		originator pgtype.UUID
-		actor pgtype.UUID
-		want bool
+		actor      pgtype.UUID
+		want       bool
 	}{
 		{"same authorized principal", creator, creator, true},
 		{"different issue creator and configured actor", creator, actor, false},
