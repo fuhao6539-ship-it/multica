@@ -104,10 +104,24 @@ func TestIssueWakeupDispatchedWaitIsObservableAndResumes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.LastError.Valid || got.LastTaskID == task.ID {
-		t.Fatal("did not resume/clear error after start")
+	if got.LastError.Valid || got.LastTaskID != task.ID {
+		t.Fatal("did not clear stale dispatch warning or unexpectedly reassigned current Task")
+	}
+	// The running Task retains the Issue's single-flight slot. Preserve the
+	// newer comment until the first Task ends, rather than creating a
+	// competing Task merely to acknowledge its input.
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND status IN ('queued','deferred','dispatched','running','waiting_local_directory')", issue); n != 1 {
+		t.Fatalf("running Issue gained a duplicate in-flight Task: %d", n)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 1 {
+		t.Fatalf("external event was consumed before the running Task ended: %d", n)
+	}
+	f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE id=$1", task.ID)
+	wakeDispatch(t, s, w)
+	if n := f.Count(t, "SELECT count(*) FROM agent_task_queue WHERE issue_id=$1 AND status='queued'", issue); n != 1 {
+		t.Fatalf("deferred event did not start exactly one successor after completion: %d", n)
 	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt WHERE wakeup_id=$1 AND processed_at IS NULL", w.ID); n != 0 {
-		t.Fatalf("pending input stalled: %d", n)
+		t.Fatalf("deferred event was not consumed after successor creation: %d", n)
 	}
 }

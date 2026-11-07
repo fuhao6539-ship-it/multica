@@ -1573,19 +1573,47 @@ WHERE id = (
       -- Event tasks never claim a terminal Issue or bypass a disabled workspace.
       AND (atq.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
            OR EXISTS (SELECT 1 FROM issue ev_i JOIN workspace ev_w
-                      ON ev_w.id=ev_i.workspace_id WHERE ev_i.id=atq.issue_id
-                        AND issue_effective_status(ev_i.workspace_id,ev_i.status)
-                            NOT IN ('done','cancelled')
-                        AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'))
-      -- Preserve normal parallel agents unless either side participates in the
-      -- single-consumer Oracle Issue event flow.
-      AND NOT EXISTS (
-          SELECT 1 FROM agent_task_queue event_busy
-          WHERE event_busy.issue_id=atq.issue_id AND event_busy.id<>atq.id
-            AND event_busy.status IN ('dispatched','running','waiting_local_directory')
-            AND (atq.context->>'oracle_issue_event'='true'
-                 OR event_busy.context->>'oracle_issue_event'='true')
-      )
+                      ON ev_w.id=ev_i.workspace_id
+                      JOIN agent ev_a ON ev_a.id=atq.agent_id AND ev_a.workspace_id=ev_i.workspace_id
+                      JOIN agent_runtime ev_r ON ev_r.id=atq.runtime_id
+                      WHERE ev_i.id=atq.issue_id
+                         AND issue_effective_status(ev_i.workspace_id,ev_i.status)
+                             IN ('todo','in_progress')
+                         AND ev_i.assignee_type='agent'
+                         AND ev_i.assignee_id=atq.agent_id
+                         AND ev_i.triage_state IS NULL
+                         AND ev_a.runtime_id=atq.runtime_id
+                         AND ev_a.kind='user' AND ev_a.archived_at IS NULL
+                         AND ev_r.workspace_id=ev_i.workspace_id AND ev_r.provider='hermes'
+            AND EXISTS (
+              SELECT 1 FROM member ev_m
+              WHERE ev_m.workspace_id=ev_i.workspace_id
+                AND ev_m.user_id::text=ev_w.settings#>>'{oracle_issue_events,actor_user_id}'
+                AND (
+                  ev_a.owner_id=ev_m.user_id
+                  OR (ev_a.permission_mode='public_to' AND EXISTS (
+                    SELECT 1 FROM agent_invocation_target ev_target
+                    WHERE ev_target.agent_id=ev_a.id
+                      AND ((ev_target.target_type='workspace' AND ev_target.target_id=ev_i.workspace_id)
+                        OR (ev_target.target_type='member' AND ev_target.target_id=ev_m.user_id))
+                    FOR SHARE OF ev_target
+                  ))
+                )
+              FOR SHARE OF ev_m
+            )
+                         AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'
+                         AND EXISTS (
+                           SELECT 1 FROM jsonb_array_elements_text(
+                             COALESCE(ev_w.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                             WITH ORDINALITY AS ea(agent_id,idx)
+                           JOIN jsonb_array_elements_text(
+                             COALESCE(ev_w.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                             WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+                           WHERE ea.agent_id=atq.agent_id::text
+                             AND er.runtime_id=atq.runtime_id::text
+                         )
+                         FOR SHARE OF ev_i, ev_w, ev_a, ev_r
+                      ))
       AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
           WHERE active.agent_id = atq.agent_id
@@ -7900,6 +7928,45 @@ WHERE id = (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = $1
       AND atq.status = 'dispatched'
+      AND (atq.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
+        OR EXISTS (
+          SELECT 1 FROM issue ri JOIN workspace rw ON rw.id=ri.workspace_id
+          JOIN agent ra ON ra.id=atq.agent_id AND ra.workspace_id=ri.workspace_id
+          JOIN agent_runtime rr ON rr.id=atq.runtime_id
+          WHERE ri.id=atq.issue_id
+            AND issue_effective_status(ri.workspace_id,ri.status) IN ('todo','in_progress')
+            AND ri.assignee_type='agent' AND ri.assignee_id=atq.agent_id
+            AND ri.triage_state IS NULL AND ra.runtime_id=atq.runtime_id
+            AND ra.kind='user' AND ra.archived_at IS NULL
+            AND rr.workspace_id=ri.workspace_id AND rr.provider='hermes'
+            AND EXISTS (
+              SELECT 1 FROM member ev_m
+              WHERE ev_m.workspace_id=ri.workspace_id
+                AND ev_m.user_id::text=rw.settings#>>'{oracle_issue_events,actor_user_id}'
+                AND (
+                  ra.owner_id=ev_m.user_id
+                  OR (ra.permission_mode='public_to' AND EXISTS (
+                    SELECT 1 FROM agent_invocation_target ev_target
+                    WHERE ev_target.agent_id=ra.id
+                      AND ((ev_target.target_type='workspace' AND ev_target.target_id=ri.workspace_id)
+                        OR (ev_target.target_type='member' AND ev_target.target_id=ev_m.user_id))
+                    FOR SHARE OF ev_target
+                  ))
+                )
+              FOR SHARE OF ev_m
+            )
+            AND rw.settings->'oracle_issue_events'->>'enabled'='true'
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                WITH ORDINALITY AS ea(agent_id,idx)
+              JOIN jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+              WHERE ea.agent_id=atq.agent_id::text AND er.runtime_id=atq.runtime_id::text
+            )
+          FOR SHARE OF ri, rw, ra, rr
+        ))
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())
@@ -8024,6 +8091,45 @@ WITH candidates AS MATERIALIZED (
     SELECT atq.id FROM agent_task_queue atq
     WHERE atq.runtime_id = ANY($2::uuid[])
       AND atq.status = 'dispatched'
+      AND (atq.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
+        OR EXISTS (
+          SELECT 1 FROM issue ri JOIN workspace rw ON rw.id=ri.workspace_id
+          JOIN agent ra ON ra.id=atq.agent_id AND ra.workspace_id=ri.workspace_id
+          JOIN agent_runtime rr ON rr.id=atq.runtime_id
+          WHERE ri.id=atq.issue_id
+            AND issue_effective_status(ri.workspace_id,ri.status) IN ('todo','in_progress')
+            AND ri.assignee_type='agent' AND ri.assignee_id=atq.agent_id
+            AND ri.triage_state IS NULL AND ra.runtime_id=atq.runtime_id
+            AND ra.kind='user' AND ra.archived_at IS NULL
+            AND rr.workspace_id=ri.workspace_id AND rr.provider='hermes'
+            AND EXISTS (
+              SELECT 1 FROM member ev_m
+              WHERE ev_m.workspace_id=ri.workspace_id
+                AND ev_m.user_id::text=rw.settings#>>'{oracle_issue_events,actor_user_id}'
+                AND (
+                  ra.owner_id=ev_m.user_id
+                  OR (ra.permission_mode='public_to' AND EXISTS (
+                    SELECT 1 FROM agent_invocation_target ev_target
+                    WHERE ev_target.agent_id=ra.id
+                      AND ((ev_target.target_type='workspace' AND ev_target.target_id=ri.workspace_id)
+                        OR (ev_target.target_type='member' AND ev_target.target_id=ev_m.user_id))
+                    FOR SHARE OF ev_target
+                  ))
+                )
+              FOR SHARE OF ev_m
+            )
+            AND rw.settings->'oracle_issue_events'->>'enabled'='true'
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                WITH ORDINALITY AS ea(agent_id,idx)
+              JOIN jsonb_array_elements_text(
+                COALESCE(rw.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+              WHERE ea.agent_id=atq.agent_id::text AND er.runtime_id=atq.runtime_id::text
+            )
+          FOR SHARE OF ri, rw, ra, rr
+        ))
       AND atq.started_at IS NULL
       AND atq.dispatched_at < now() - make_interval(secs => $3::double precision)
       AND (atq.prepare_lease_expires_at IS NULL OR atq.prepare_lease_expires_at < now())

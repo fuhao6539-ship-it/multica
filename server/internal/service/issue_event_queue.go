@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/attribution"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -142,15 +143,16 @@ func (s *IssueWakeupService) nativePendingIssues(ctx context.Context, ws pgtype.
  AND issue_effective_status(i.workspace_id,i.status) IN ('todo','in_progress')
  AND i.assignee_type='agent' AND i.assignee_id=ANY($3::uuid[])
  AND i.triage_state IS NULL
- AND NOT EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=i.id
-   AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
+  AND NOT EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=i.id
+    AND t.agent_id=i.assignee_id AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
  -- Terminal Task failures are consumed by the original retry mechanism;
  -- do not mint a fresh attempt=1 Task after an exhausted/nonretryable failure.
  AND COALESCE((SELECT t.status FROM agent_task_queue t
-   WHERE t.issue_id=i.id ORDER BY t.created_at DESC,t.id DESC LIMIT 1),'')<>'failed'
+   WHERE t.issue_id=i.id AND t.agent_id=i.assignee_id
+    ORDER BY t.created_at DESC,t.id DESC LIMIT 1),'')<>'failed'
  ORDER BY
-   COALESCE((SELECT MAX(t.completed_at) FROM agent_task_queue t WHERE t.issue_id=i.id),to_timestamp(0)) ASC,
    CASE i.priority WHEN 'urgent' THEN 4 WHEN 'high' THEN 3 WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END DESC,
+   COALESCE((SELECT MAX(t.completed_at) FROM agent_task_queue t WHERE t.issue_id=i.id),to_timestamp(0)) ASC,
    i.created_at,i.id LIMIT $2::integer`, ws, int32(nativeEventBatchSize), agentIDs)
 	if err != nil {
 		return nil, err
@@ -186,6 +188,12 @@ func (s *IssueWakeupService) nativeEventTargets(ctx context.Context, ws nativeEv
 		if agent.RuntimeID != expectedRuntime {
 			continue
 		}
+		// An online non-Oracle Runtime must never silently join this
+		// unattended Oracle-only flow.
+		rt, err := s.Tasks.Queries.GetAgentRuntime(ctx, agent.RuntimeID)
+		if err != nil || rt.WorkspaceID != ws.id || rt.Provider != nativeOracleACPProvider {
+			continue
+		}
 
 		if s.authorize(ctx, s.Tasks.Queries, ws.id, actor, agent) != nil {
 			continue
@@ -208,6 +216,23 @@ func (s *IssueWakeupService) nativeEventTargets(ctx context.Context, ws nativeEv
 func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueID pgtype.UUID,
 	agent db.Agent, actor pgtype.UUID) (db.AgentTaskQueue, bool, error) {
 	var zero db.AgentTaskQueue
+	// Resolve the native provenance and runtime overlay BEFORE taking DB locks.
+	// An unattended event is not a fresh human click by the config actor.
+	original, err := s.Tasks.Queries.GetIssue(ctx, issueID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return zero, false, nil
+	}
+	if err != nil {
+		return zero, false, err
+	}
+	attr := s.Tasks.attributionForIssueTask(ctx, original, pgtype.UUID{}, attribution.SourceCommentSource, pgtype.UUID{})
+	attr, err = s.Tasks.applyAttributionFallback(ctx, attr, agent)
+	if err != nil {
+		return zero, false, err
+	}
+	overlay := s.Tasks.buildRuntimeMCPOverlay(ctx, attr.UserID, agent)
+	attrSource, delegatedFrom, evidenceKind, evidenceRef := attributionCreateParams(attr)
+	head := headShaText(s.Tasks.ResolveIssueReviewSHA(ctx, issueID))
 	tx, err := s.Tasks.TxStarter.Begin(ctx)
 	if err != nil {
 		return zero, false, err
@@ -238,16 +263,16 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if !bound {
 		return zero, false, nil
 	}
-	// Transaction-local advisory lock shared with the native Claim guard.
-	var issueLock bool
-	if err = tx.QueryRow(ctx,
-		"SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, 2746))",
-		issueID).Scan(&issueLock); err != nil {
+	// Reuse the original member/invocation policy inside this native
+	// enqueue transaction, rather than only a prior target-list read.
+	q := s.Tasks.Queries.WithTx(tx)
+	if err = s.authorize(ctx, q, agent.WorkspaceID, actor, agent); err != nil {
+		if errors.Is(err, ErrWakeupForbidden) {
+			return zero, false, nil
+		}
 		return zero, false, err
 	}
-	if !issueLock {
-		return zero, false, nil
-	}
+	// Rely on the existing native owner and Issue row locks below.
 	var ok bool
 	if err = tx.QueryRow(ctx, "SELECT lock_task_owner_rows($1,$2,$3)",
 		agent.ID, issueID, agent.RuntimeID).Scan(&ok); err != nil {
@@ -267,7 +292,6 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 		}
 		return zero, false, err
 	}
-	q := s.Tasks.Queries.WithTx(tx)
 	issue, err := q.GetIssue(ctx, issueID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return zero, false, nil
@@ -275,7 +299,27 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if err != nil {
 		return zero, false, err
 	}
-	if issue.WorkspaceID != agent.WorkspaceID {
+	if issue.WorkspaceID != agent.WorkspaceID || issue.Revision != original.Revision {
+		// Provenance, overlay and review SHA were computed for the original
+		// Issue revision outside this short transaction. Never enqueue a
+		// mixed-version Task; the native Tick will retry fresh.
+		return zero, false, nil
+	}
+	// The owner/runtime/permission observed when building the MCP overlay
+	// must still describe the same Agent after the owner-row locks.
+	currentAgent, err := q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: agent.ID, WorkspaceID: agent.WorkspaceID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return zero, false, nil
+	}
+	if err != nil {
+		return zero, false, err
+	}
+	if currentAgent.UpdatedAt.Valid != agent.UpdatedAt.Valid ||
+		!currentAgent.UpdatedAt.Time.Equal(agent.UpdatedAt.Time) ||
+		currentAgent.RuntimeID != agent.RuntimeID ||
+		currentAgent.OwnerID != agent.OwnerID ||
+		currentAgent.PermissionMode != agent.PermissionMode ||
+		currentAgent.ArchivedAt.Valid {
 		return zero, false, nil
 	}
 	category, err := issuestatus.CategoryWithError(ctx, q, issue.WorkspaceID, issue.Status)
@@ -294,31 +338,33 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	// never reset attempt=1 just because the Issue is still unfinished.
 	var failedTerminal bool
 	err = tx.QueryRow(ctx, `SELECT COALESCE((SELECT t.status='failed'
-	  FROM agent_task_queue t WHERE t.issue_id=$1
-	  ORDER BY t.created_at DESC,t.id DESC LIMIT 1),false)`, issueID).Scan(&failedTerminal)
+	  FROM agent_task_queue t WHERE t.issue_id=$1 AND t.agent_id=$2
+	  ORDER BY t.created_at DESC,t.id DESC LIMIT 1),false)`, issueID, agent.ID).Scan(&failedTerminal)
 	if err != nil {
 		return zero, false, err
 	}
 	if failedTerminal {
 		return zero, false, nil
 	}
+	// Multica's existing per-(Issue, Agent) Task uniqueness remains authoritative.
 	var occupied bool
 	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM agent_task_queue
-  WHERE issue_id=$1 AND status IN
-  ('queued','dispatched','running','deferred','waiting_local_directory'))`, issueID).Scan(&occupied)
+   WHERE issue_id=$1 AND agent_id=$2 AND status IN
+   ('queued','dispatched','running','deferred','waiting_local_directory'))`, issueID, agent.ID).Scan(&occupied)
 	if err != nil {
 		return zero, false, err
 	}
 	if occupied {
 		return zero, false, nil
 	}
-	overlay := s.Tasks.buildRuntimeMCPOverlay(ctx, actor, agent)
 	task, err := q.CreateAgentTask(ctx, db.CreateAgentTaskParams{
 		ID: dbid.NewV7(), AgentID: agent.ID, RuntimeID: agent.RuntimeID,
 		IssueID: issueID, Priority: priorityToInt(issue.Priority),
 		TriggerSummary:   pgtype.Text{String: "Native unfinished-Issue event", Valid: true},
-		OriginatorUserID: actor, AccountableUserID: actor,
-		OriginatorSource:  pgtype.Text{String: "trigger_owner", Valid: true},
+		OriginatorUserID: attr.UserID, AccountableUserID: attr.AccountableUserID,
+		OriginatorSource: attrSource, DelegatedFromTaskID: delegatedFrom,
+		TriggerEvidenceKind: evidenceKind, TriggerEvidenceRefID: evidenceRef,
+		RuleVersionID: attr.RuleVersionID, HeadSha: head,
 		RuntimeMcpOverlay: overlay.Overlay, RuntimeConnectedApps: overlay.ConnectedApps,
 	})
 	if err != nil {

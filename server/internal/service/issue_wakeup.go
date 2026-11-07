@@ -1270,8 +1270,16 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 			return err
 		}
 		if waiting {
-			// As while its own run is claimed: timers advance, inputs stay,
-			// and a once rule stays on until its input is handed over.
+			// A periodic tick already covered by this Issue's pending Task
+			// must not linger as an unprocessed follow-up after that Task ends.
+			// Unlike external event receipts, a timer needs no join evidence.
+			if w.Kind == "every" || w.Kind == "cron" {
+				if err = q.ConsumeWakeupReceipts(ctx, db.ConsumeWakeupReceiptsParams{Ids: ids}); err != nil {
+					return err
+				}
+			}
+			// External events and once rules still keep inputs for the
+			// waiting Task, so native JoinWaitingWakeups can deliver them.
 			if err = q.AdvanceIssueWakeup(ctx, db.AdvanceIssueWakeupParams{ID: w.ID, Enabled: w.Enabled, NextFireAt: next}); err != nil {
 				return err
 			}
@@ -1283,6 +1291,46 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 			return commit()
 		}
 	}
+
+	// A separate Wakeup on the same Issue may already have queued or started
+	// the original native Task. FindPendingWakeupTask above is rule-scoped, so
+	// it cannot by itself enforce Issue-level single flight. LockWakeupIssue
+	// holds FOR NO KEY UPDATE until commit, serializing all Wakeup dispatchers
+	// for this Issue; the active-Task check and new insert therefore cannot
+	// race between distinct Wakeup rules.
+	if !taskExists {
+		var issueBusy bool
+		if err = tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM agent_task_queue
+			WHERE issue_id=$1 AND status IN
+				('queued','deferred','dispatched','running','waiting_local_directory')
+		)`, issue.ID).Scan(&issueBusy); err != nil {
+			return err
+		}
+		if issueBusy {
+			// The periodic rule is only a missed-event fallback. A timer tick
+			// covered by an existing Issue Task must not start a redundant
+			// Task after that run completes. Event/once inputs are retained
+			// for normal acknowledgment/re-evaluation instead of lost.
+			if w.Kind == "every" || w.Kind == "cron" {
+				if err = q.ConsumeWakeupReceipts(ctx, db.ConsumeWakeupReceiptsParams{Ids: ids}); err != nil {
+					return err
+				}
+			}
+			if err = q.AdvanceIssueWakeup(ctx, db.AdvanceIssueWakeupParams{
+				ID: w.ID, Enabled: w.Enabled && !timedOut, NextFireAt: next,
+			}); err != nil {
+				return err
+			}
+			if timedOut {
+				if err = markTimedOut(); err != nil {
+					return err
+				}
+			}
+			return commit()
+		}
+	}
+
 	var chain []string
 	if !taskExists {
 		var loop bool
