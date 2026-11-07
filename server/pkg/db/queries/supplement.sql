@@ -8,6 +8,51 @@ WITH candidate AS MATERIALIZED (
     JOIN agent_runtime r ON r.id = t.runtime_id
     WHERE t.id = @task_id
       AND t.status IN ('dispatched', 'waiting_local_directory')
+      AND (
+        t.context->>'oracle_issue_event' IS DISTINCT FROM 'true'
+        OR EXISTS (
+          SELECT 1 FROM issue ev_i
+          JOIN workspace ev_w ON ev_w.id=ev_i.workspace_id
+          JOIN agent ev_a ON ev_a.id=t.agent_id AND ev_a.workspace_id=ev_i.workspace_id
+          JOIN agent_runtime ev_r ON ev_r.id=t.runtime_id
+          WHERE ev_i.id=t.issue_id AND ev_i.workspace_id=r.workspace_id
+            AND issue_effective_status(ev_i.workspace_id, ev_i.status)
+                IN ('todo','in_progress')
+            AND ev_i.assignee_type='agent' AND ev_i.assignee_id=t.agent_id
+            AND ev_i.triage_state IS NULL
+            AND ev_a.runtime_id=t.runtime_id
+            AND ev_a.kind='user' AND ev_a.archived_at IS NULL
+            AND ev_r.workspace_id=ev_i.workspace_id AND ev_r.provider='hermes'
+            AND EXISTS (
+              SELECT 1 FROM member ev_m
+              WHERE ev_m.workspace_id=ev_i.workspace_id
+                AND ev_m.user_id::text=ev_w.settings#>>'{oracle_issue_events,actor_user_id}'
+                AND (
+                  ev_a.owner_id=ev_m.user_id
+                  OR (ev_a.permission_mode='public_to' AND EXISTS (
+                    SELECT 1 FROM agent_invocation_target ev_target
+                    WHERE ev_target.agent_id=ev_a.id
+                      AND ((ev_target.target_type='workspace' AND ev_target.target_id=ev_i.workspace_id)
+                        OR (ev_target.target_type='member' AND ev_target.target_id=ev_m.user_id))
+                    FOR SHARE OF ev_target
+                  ))
+                )
+              FOR SHARE OF ev_m
+            )
+            AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'
+            AND EXISTS (
+              SELECT 1 FROM jsonb_array_elements_text(
+                (CASE WHEN jsonb_typeof(ev_w.settings#>'{oracle_issue_events,agent_ids}')='array' THEN ev_w.settings#>'{oracle_issue_events,agent_ids}' ELSE '[]'::jsonb END))
+                WITH ORDINALITY AS ea(agent_id,idx)
+              JOIN jsonb_array_elements_text(
+                (CASE WHEN jsonb_typeof(ev_w.settings#>'{oracle_issue_events,runtime_ids}')='array' THEN ev_w.settings#>'{oracle_issue_events,runtime_ids}' ELSE '[]'::jsonb END))
+                WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
+              WHERE ea.agent_id=t.agent_id::text
+                AND er.runtime_id=t.runtime_id::text
+            )
+          FOR SHARE OF ev_i, ev_w, ev_a, ev_r
+        )
+      )
     FOR UPDATE OF t
 ), capability AS (
     INSERT INTO task_supplement_capability (task_id, workspace_id, issue_id, capability)
@@ -320,3 +365,16 @@ FOR UPDATE;
 -- name: DeleteTaskSupplementByComment :exec
 DELETE FROM task_supplement
 WHERE comment_id = @comment_id AND workspace_id = @workspace_id;
+
+-- name: LockNativeOracleEventIssueBeforeTaskStart :many
+-- The existing Issue-close transaction locks Issue then cancels unstarted Tasks.
+-- Preserve that order for native Oracle event Start, including both old and
+-- claim-token Start APIs. Ordinary Tasks match zero rows and retain their path.
+-- A stale Task identity is rechecked by LockAgentTaskStartClaim afterward.
+SELECT i.id FROM agent_task_queue t
+JOIN issue i ON i.id=t.issue_id
+WHERE t.id=$1::uuid
+  AND t.context->>'oracle_issue_event'='true'
+  AND t.status IN ('dispatched','waiting_local_directory')
+FOR SHARE OF i;
+

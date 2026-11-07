@@ -1,1 +1,0 @@
-DROP INDEX CONCURRENTLY IF EXISTS idx_native_oracle_event_one_active_issue;

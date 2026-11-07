@@ -71,7 +71,7 @@ WHERE issue_id= @issue_id AND disabled_at IS NULL AND system_rule IS NULL;
 UPDATE agent_task_queue SET status='cancelled',completed_at=now(),error='Issue closed; wakeup disabled'
 WHERE issue_id= @issue_id AND started_at IS NULL
   AND ((context->>'wakeup_id' IS NOT NULL AND status IN ('queued','deferred'))
-       OR (context->>'oracle_issue_event'='true' AND status IN ('queued','deferred','dispatched'))) RETURNING *;
+       OR (context->>'oracle_issue_event'='true' AND status IN ('queued','deferred','dispatched','waiting_local_directory'))) RETURNING *;
 -- name: ListInputWakeups :many
 -- Scheduler lane 1: rules with unprocessed inputs (subscribed events,
 -- condition hints, "wake now"). Deliberately not filtered by enabled: a once
