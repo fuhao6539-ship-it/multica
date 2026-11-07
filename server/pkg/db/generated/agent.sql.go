@@ -1604,10 +1604,10 @@ WHERE id = (
                          AND ev_w.settings->'oracle_issue_events'->>'enabled'='true'
                          AND EXISTS (
                            SELECT 1 FROM jsonb_array_elements_text(
-                             COALESCE(ev_w.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                             (CASE WHEN jsonb_typeof(ev_w.settings#>'{oracle_issue_events,agent_ids}')='array' THEN ev_w.settings#>'{oracle_issue_events,agent_ids}' ELSE '[]'::jsonb END))
                              WITH ORDINALITY AS ea(agent_id,idx)
                            JOIN jsonb_array_elements_text(
-                             COALESCE(ev_w.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                             (CASE WHEN jsonb_typeof(ev_w.settings#>'{oracle_issue_events,runtime_ids}')='array' THEN ev_w.settings#>'{oracle_issue_events,runtime_ids}' ELSE '[]'::jsonb END))
                              WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
                            WHERE ea.agent_id=atq.agent_id::text
                              AND er.runtime_id=atq.runtime_id::text
@@ -7958,10 +7958,10 @@ WHERE id = (
             AND rw.settings->'oracle_issue_events'->>'enabled'='true'
             AND EXISTS (
               SELECT 1 FROM jsonb_array_elements_text(
-                COALESCE(rw.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                (CASE WHEN jsonb_typeof(rw.settings#>'{oracle_issue_events,agent_ids}')='array' THEN rw.settings#>'{oracle_issue_events,agent_ids}' ELSE '[]'::jsonb END))
                 WITH ORDINALITY AS ea(agent_id,idx)
               JOIN jsonb_array_elements_text(
-                COALESCE(rw.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                (CASE WHEN jsonb_typeof(rw.settings#>'{oracle_issue_events,runtime_ids}')='array' THEN rw.settings#>'{oracle_issue_events,runtime_ids}' ELSE '[]'::jsonb END))
                 WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
               WHERE ea.agent_id=atq.agent_id::text AND er.runtime_id=atq.runtime_id::text
             )
@@ -8121,10 +8121,10 @@ WITH candidates AS MATERIALIZED (
             AND rw.settings->'oracle_issue_events'->>'enabled'='true'
             AND EXISTS (
               SELECT 1 FROM jsonb_array_elements_text(
-                COALESCE(rw.settings#>'{oracle_issue_events,agent_ids}','[]'::jsonb))
+                (CASE WHEN jsonb_typeof(rw.settings#>'{oracle_issue_events,agent_ids}')='array' THEN rw.settings#>'{oracle_issue_events,agent_ids}' ELSE '[]'::jsonb END))
                 WITH ORDINALITY AS ea(agent_id,idx)
               JOIN jsonb_array_elements_text(
-                COALESCE(rw.settings#>'{oracle_issue_events,runtime_ids}','[]'::jsonb))
+                (CASE WHEN jsonb_typeof(rw.settings#>'{oracle_issue_events,runtime_ids}')='array' THEN rw.settings#>'{oracle_issue_events,runtime_ids}' ELSE '[]'::jsonb END))
                 WITH ORDINALITY AS er(runtime_id,idx) ON ea.idx=er.idx
               WHERE ea.agent_id=atq.agent_id::text AND er.runtime_id=atq.runtime_id::text
             )
