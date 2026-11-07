@@ -143,6 +143,9 @@ func (s *IssueWakeupService) nativePendingIssues(ctx context.Context, ws pgtype.
  AND issue_effective_status(i.workspace_id,i.status) IN ('todo','in_progress')
  AND i.assignee_type='agent' AND i.assignee_id=ANY($3::uuid[])
  AND i.triage_state IS NULL
+ -- An enabled original Wakeup is itself an Issue reservation, even before
+ -- its first Task exists; the existing Wakeup service owns that continuation.
+ AND NOT EXISTS (SELECT 1 FROM issue_wakeup w WHERE w.issue_id=i.id AND w.enabled)
   AND NOT EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=i.id
     AND t.status IN ('queued','dispatched','running','deferred','waiting_local_directory'))
  -- Terminal Task failures are consumed by the original retry mechanism;
@@ -332,6 +335,17 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 		return zero, false, nil
 	}
 	if !nativeEventMayRun(issue, issuestatus.Effective(ctx, q, issue.WorkspaceID, issue.Status), agent) {
+		return zero, false, nil
+	}
+	// The original Issue SHARE lock serializes with Wakeup registration's
+	// NO KEY UPDATE lock: check the already-registered reservation again in
+	// the same transaction that would create a native event Task.
+	var wakeupReserved bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM issue_wakeup w
+	  WHERE w.issue_id=$1 AND w.enabled)`, issueID).Scan(&wakeupReserved); err != nil {
+		return zero, false, err
+	}
+	if wakeupReserved {
 		return zero, false, nil
 	}
 	// Native FailTask owns its retry child and budget. An exhausted or
