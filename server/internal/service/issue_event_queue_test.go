@@ -101,3 +101,50 @@ func TestNativeIssueEventPriorityBeforePreviousCompletion(t *testing.T) {
 		t.Fatalf("urgent must precede high even with a recent completion; got %v", ids)
 	}
 }
+
+
+// TestNativeIssueEventReassignmentPreservesIssueWideInFlight exercises the real
+// PostgreSQL Task table, not a simulated concurrency counter. Reassigning an
+// unfinished Issue must not hide a running Task owned by the previous Agent.
+// Once that Task terminates, the Issue can be selected by the new assignee.
+func TestNativeIssueEventReassignmentPreservesIssueWideInFlight(t *testing.T) {
+	f, wakeup, issue, currentAgentID := wakeFixture(t)
+	ctx := context.Background()
+	ws := parseTestUUID(t, f.WorkspaceID)
+	var runtimeID string
+	f.QueryRow(t, "SELECT runtime_id::text FROM agent WHERE id=$1", currentAgentID).Scan(&runtimeID)
+	priorAgentID := f.Agent(t, "Previous assignee", runtimeID)
+	f.Exec(t, "UPDATE issue SET status='todo',assignee_type='agent',assignee_id=$2,triage_state=NULL WHERE id=$1", issue, currentAgentID)
+	taskID := f.Task(t, priorAgentID, testutil.Cols{
+		"issue_id": issue,
+		"status": "running",
+		"started_at": testutil.Raw("now()"),
+		"runtime_id": runtimeID,
+	})
+	agent, err := f.q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID: parseTestUUID(t, currentAgentID), WorkspaceID: ws,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := wakeup.nativePendingIssues(ctx, ws, []nativeEventTarget{{agent: agent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range pending {
+		if id == parseTestUUID(t, issue) {
+			t.Fatal("reassignment hid prior Agent's running Task and allowed duplicate queueing")
+		}
+	}
+	f.Exec(t, "UPDATE agent_task_queue SET status='completed',completed_at=now() WHERE id=$1", taskID)
+	pending, err = wakeup.nativePendingIssues(ctx, ws, []nativeEventTarget{{agent: agent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range pending {
+		if id == parseTestUUID(t, issue) {
+			return
+		}
+	}
+	t.Fatal("terminal Task did not release the original Issue for the new assignee")
+}
