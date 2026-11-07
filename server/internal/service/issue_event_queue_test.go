@@ -148,3 +148,57 @@ func TestNativeIssueEventReassignmentPreservesIssueWideInFlight(t *testing.T) {
 	}
 	t.Fatal("terminal Task did not release the original Issue for the new assignee")
 }
+
+
+// TestNativeIssueEventReassignmentDoesNotReplayPreviousAgentFailure uses the
+// original PostgreSQL Task table to guard an exhausted/nonretryable failure.
+// Reassignment must not erase the earlier Agent's failed Task, even when the
+// new Agent has no Task history. A human-authorized explicit native rerun is
+// separate from unattended Issue-event refilling.
+func TestNativeIssueEventReassignmentDoesNotReplayPreviousAgentFailure(t *testing.T) {
+	f, wakeup, issue, currentAgentID := wakeFixture(t)
+	ctx := context.Background()
+	ws := parseTestUUID(t, f.WorkspaceID)
+	var runtimeID string
+	f.QueryRow(t, "SELECT runtime_id::text FROM agent WHERE id=$1", currentAgentID).Scan(&runtimeID)
+	previousAgentID := f.Agent(t, "Prior failed assignee", runtimeID)
+	f.Exec(t, "UPDATE issue SET status='todo',assignee_type='agent',assignee_id=$2,triage_state=NULL WHERE id=$1",
+		issue, currentAgentID)
+	f.Task(t, previousAgentID, testutil.Cols{
+		"issue_id": issue, "runtime_id": runtimeID, "status": "failed",
+		"completed_at": testutil.Raw("now()"),
+	})
+	agent, err := f.q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{
+		ID: parseTestUUID(t, currentAgentID), WorkspaceID: ws,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := wakeup.nativePendingIssues(ctx, ws, []nativeEventTarget{{agent: agent}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range pending {
+		if id == parseTestUUID(t, issue) {
+			t.Fatal("reassignment hid prior Agent's failed Task and made Issue auto-runnable")
+		}
+	}
+
+	// Also exercise the transactional insertion guard independently of the
+	// refill SELECT, using a real workspace opt-in for the new assignee.
+	f.Exec(t, "UPDATE agent_runtime SET provider='hermes' WHERE id=$1", runtimeID)
+	f.Exec(t, `UPDATE workspace SET settings=jsonb_set(
+		COALESCE(settings,'{}'::jsonb),'{oracle_issue_events}',
+		jsonb_build_object('enabled',true,'actor_user_id',$2::text,
+			'agent_ids',jsonb_build_array($3::text),
+			'runtime_ids',jsonb_build_array($4::text)),true)
+		WHERE id=$1`, f.WorkspaceID, f.UserID, currentAgentID, runtimeID)
+	_, inserted, err := wakeup.enqueueNativeIssueEvent(
+		ctx, parseTestUUID(t, issue), agent, parseTestUUID(t, f.UserID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted {
+		t.Fatal("transactional enqueue blindly replayed previous Agent's failed Task")
+	}
+}
