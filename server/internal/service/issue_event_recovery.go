@@ -41,6 +41,10 @@ func (s *IssueWakeupService) RecoverOrphanedNativeEventTasks(ctx context.Context
            i.id IS NULL
            OR issue_effective_status(i.workspace_id,i.status) NOT IN ('todo','in_progress')
            OR i.triage_state IS NOT NULL
+           -- A newly registered native Wakeup supersedes any unstarted
+           -- generic Issue-event Task; never cancel an already running Task.
+           OR EXISTS (SELECT 1 FROM issue_wakeup iw
+             WHERE iw.issue_id=i.id AND iw.enabled)
            OR i.assignee_type IS DISTINCT FROM 'agent'
            OR i.assignee_id IS DISTINCT FROM t.agent_id
            OR a.workspace_id IS DISTINCT FROM i.workspace_id
