@@ -61,23 +61,23 @@ func parseNativeEventConfig(raw []byte) (nativeEventConfig, bool) {
 		return nativeEventConfig{}, false
 	}
 	c := settings.Events
-	if !c.Enabled || c.ActorUserID == "" || len(c.AgentIDs) == 0 || len(c.AgentIDs) > 2 ||
+	if !c.Enabled || c.ActorUserID == "" || len(c.AgentIDs) == 0 ||
 		len(c.RuntimeIDs) != len(c.AgentIDs) {
 		return nativeEventConfig{}, false
 	}
 	if _, err := nativeEventUUID(c.ActorUserID); err != nil {
 		return nativeEventConfig{}, false
 	}
-	agents, runtimes := map[string]bool{}, map[string]bool{}
+	agents := map[string]bool{}
 	for idx, a := range c.AgentIDs {
 		rt := c.RuntimeIDs[idx]
 		if _, err := nativeEventUUID(a); err != nil || agents[a] {
 			return nativeEventConfig{}, false
 		}
-		if _, err := nativeEventUUID(rt); err != nil || runtimes[rt] {
+		if _, err := nativeEventUUID(rt); err != nil {
 			return nativeEventConfig{}, false
 		}
-		agents[a], runtimes[rt] = true, true
+		agents[a] = true
 	}
 	return c, true
 }

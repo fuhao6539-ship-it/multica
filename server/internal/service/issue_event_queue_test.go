@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/testutil"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 func TestNativeIssueEventWorkspaceOptIn(t *testing.T) {
@@ -20,12 +21,24 @@ func TestNativeIssueEventWorkspaceOptIn(t *testing.T) {
 	if !ok || !c.Enabled || len(c.AgentIDs) != 2 {
 		t.Fatalf("explicit owner opt-in rejected: %v %v", ok, c)
 	}
+	// Multiple native agents are allowed to share one runtime; the Agent ID,
+	// not the runtime ID, is the unique assignment identity in Multica.
+	shared := map[string]any{"oracle_issue_events": map[string]any{
+		"enabled":       true,
+		"actor_user_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		"agent_ids":     []string{"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "cccccccc-cccc-4ccc-8ccc-cccccccccccc", "ffffffff-ffff-4fff-8fff-ffffffffffff"},
+		"runtime_ids":   []string{"dddddddd-dddd-4ddd-8ddd-dddddddddddd", "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "dddddddd-dddd-4ddd-8ddd-dddddddddddd"},
+	}}
+	sharedRaw, _ := json.Marshal(shared)
+	sharedCfg, ok := parseNativeEventConfig(sharedRaw)
+	if !ok || len(sharedCfg.AgentIDs) != 3 {
+		t.Fatalf("valid 3-agent shared-runtime native config rejected: ok=%v cfg=%+v", ok, sharedCfg)
+	}
 	for _, bad := range []string{
 		"{}",
 		// Fail closed when a selected Agent has no exact Runtime binding.
 		`{"oracle_issue_events":{"enabled":true,"actor_user_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","agent_ids":["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]}}`,
 		`{"oracle_issue_events":{"enabled":true,"actor_user_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","agent_ids":["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","cccccccc-cccc-4ccc-8ccc-cccccccccccc"],"runtime_ids":["dddddddd-dddd-4ddd-8ddd-dddddddddddd"]}}`,
-		`{"oracle_issue_events":{"enabled":true,"actor_user_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","agent_ids":["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","cccccccc-cccc-4ccc-8ccc-cccccccccccc"],"runtime_ids":["dddddddd-dddd-4ddd-8ddd-dddddddddddd","dddddddd-dddd-4ddd-8ddd-dddddddddddd"]}}`,
 
 		`{"oracle_issue_events":{"enabled":false,"actor_user_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","agent_ids":["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]}}`,
 		`{"oracle_issue_events":{"enabled":true,"actor_user_id":"not-an-id","agent_ids":["bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]}}`,
@@ -34,6 +47,54 @@ func TestNativeIssueEventWorkspaceOptIn(t *testing.T) {
 		if _, ok := parseNativeEventConfig([]byte(bad)); ok {
 			t.Fatalf("unexpected queue enable for %q", bad)
 		}
+	}
+}
+
+// TestNativeSharedRuntimeAssigneesUseOriginalIssueOwner proves with the
+// original PostgreSQL-backed Issue table that shared Runtime reuse does not
+// replace or conflate the assigned Agent identity.
+func TestNativeSharedRuntimeAssigneesUseOriginalIssueOwner(t *testing.T) {
+	f, wakeup, firstIssue, firstAgentID := wakeFixture(t)
+	ctx := context.Background()
+	ws := parseTestUUID(t, f.WorkspaceID)
+	var runtimeID string
+	f.QueryRow(t, "SELECT runtime_id::text FROM agent WHERE id=$1", firstAgentID).Scan(&runtimeID)
+	secondAgentID := f.Agent(t, "Shared runtime agent B", runtimeID)
+	thirdAgentID := f.Agent(t, "Shared runtime agent C", runtimeID)
+	secondIssue := f.Issue(t, "Second owner's pending Issue")
+	thirdIssue := f.Issue(t, "Third owner's pending Issue")
+	ownerByIssue := map[string]string{util.UUIDToString(firstIssue): firstAgentID, secondIssue: secondAgentID, thirdIssue: thirdAgentID}
+	targets := make([]nativeEventTarget, 0, 3)
+	for issueID, agentID := range ownerByIssue {
+		f.Exec(t, "UPDATE issue SET status='todo',assignee_type='agent',assignee_id=$2,triage_state=NULL WHERE id=$1", issueID, agentID)
+		agent, err := f.q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: parseTestUUID(t, agentID), WorkspaceID: ws})
+		if err != nil {
+			t.Fatal(err)
+		}
+		targets = append(targets, nativeEventTarget{agent: agent})
+	}
+	ids, err := wakeup.nativePendingIssues(ctx, ws, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool)
+	for _, id := range ids {
+		issue, err := f.q.GetIssue(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := nativeEventRecipient(targets, issue)
+		for issueID, agentID := range ownerByIssue {
+			if issue.ID == parseTestUUID(t, issueID) {
+				seen[issueID] = true
+				if got.ID != parseTestUUID(t, agentID) {
+					t.Fatalf("Issue %s assigned to %s but selected %v", issueID, agentID, got.ID)
+				}
+			}
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("wanted 3 independently runnable shared-runtime Issues; got %v", seen)
 	}
 }
 
