@@ -331,7 +331,7 @@ func (s *IssueWakeupService) enqueueNativeIssueEvent(ctx context.Context, issueI
 	if nativeEventCategoryIsTerminal(category) {
 		return zero, false, nil
 	}
-	if !nativeEventMayRun(issue, category, agent) {
+	if !nativeEventMayRun(issue, issuestatus.Effective(ctx, q, issue.WorkspaceID, issue.Status), agent) {
 		return zero, false, nil
 	}
 	// Native FailTask owns its retry child and budget. An exhausted or
