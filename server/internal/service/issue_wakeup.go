@@ -1228,9 +1228,13 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 		return commit()
 	}
 	ids := make([]pgtype.UUID, 0, len(receipts))
+	timerIDs := make([]pgtype.UUID, 0, len(receipts))
 	manual := true
 	for _, r := range receipts {
 		ids = append(ids, r.ID)
+		if r.EventType == "time.due" {
+			timerIDs = append(timerIDs, r.ID)
+		}
 		manual = manual && r.EventType == wakeupManualEventType
 	}
 	if w.Mode == "once" {
@@ -1273,8 +1277,8 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 			// A periodic tick already covered by this Issue's pending Task
 			// must not linger as an unprocessed follow-up after that Task ends.
 			// Unlike external event receipts, a timer needs no join evidence.
-			if w.Kind == "every" || w.Kind == "cron" {
-				if err = q.ConsumeWakeupReceipts(ctx, db.ConsumeWakeupReceiptsParams{Ids: ids}); err != nil {
+			if (w.Kind == "every" || w.Kind == "cron") && len(timerIDs) > 0 {
+				if err = q.ConsumeWakeupReceipts(ctx, db.ConsumeWakeupReceiptsParams{Ids: timerIDs}); err != nil {
 					return err
 				}
 			}
@@ -1312,8 +1316,8 @@ func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) 
 			// covered by an existing Issue Task must not start a redundant
 			// Task after that run completes. Event/once inputs are retained
 			// for normal acknowledgment/re-evaluation instead of lost.
-			if w.Kind == "every" || w.Kind == "cron" {
-				if err = q.ConsumeWakeupReceipts(ctx, db.ConsumeWakeupReceiptsParams{Ids: ids}); err != nil {
+			if (w.Kind == "every" || w.Kind == "cron") && len(timerIDs) > 0 {
+				if err = q.ConsumeWakeupReceipts(ctx, db.ConsumeWakeupReceiptsParams{Ids: timerIDs}); err != nil {
 					return err
 				}
 			}
